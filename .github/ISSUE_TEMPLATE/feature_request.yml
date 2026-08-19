@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an improvement
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        drivelite is deliberately small, and a **read-only viewer**. Uploading,
+        renaming and deleting are out of scope — that boundary is what lets it
+        mount your data read-only. Ideas that keep it a viewer are welcome.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation you hit, not only the feature you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including whether an existing option or a reverse proxy already covers it.
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Fit with the project
+      options:
+        - label: This keeps drivelite read-only (no writes to the served folder)
+        - label: I believe this can be done without adding a third-party dependency

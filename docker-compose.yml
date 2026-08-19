@@ -1,0 +1,34 @@
+services:
+  drivelite:
+    build: .
+    image: drivelite:latest
+    container_name: drivelite
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # The folder you want to share. Read-only: the app never writes to it.
+      - ./share:/data:ro
+      # Thumbnail cache. Keep it on a named volume so it survives restarts.
+      - thumbs:/cache
+    environment:
+      DRIVELITE_TITLE: "Shared Files"
+      # Set a real password before exposing this anywhere.
+      DRIVELITE_PASSWORD: "change-me"
+      # Optional: several accounts instead of one shared password.
+      # DRIVELITE_USERS: "alice:secret,bob:hunter2"
+      # Keeps sessions valid across restarts. Any long random string.
+      # DRIVELITE_SESSION_KEY: "replace-with-32-plus-random-bytes"
+      # Turn on when running behind HTTPS.
+      DRIVELITE_SECURE_COOKIE: "false"
+      DRIVELITE_THUMB_PX: "400"
+      DRIVELITE_THUMB_JOBS: "4"
+      DRIVELITE_ENABLE_ZIP: "true"
+      # DRIVELITE_MAX_ZIP_MB: "4096"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  thumbs:

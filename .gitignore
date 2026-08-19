@@ -1,0 +1,20 @@
+# build output
+/drivelite
+/dist/
+*.exe
+
+# local test fixtures and mounts
+/share/
+/cache/
+/testdata-tmp/
+
+# go tooling
+*.test
+*.out
+coverage.txt
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp

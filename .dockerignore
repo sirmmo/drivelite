@@ -1,0 +1,17 @@
+# Keep the build context to just what the Dockerfile copies.
+.git
+.github
+docs/
+share/
+cache/
+dist/
+build/
+testdata-tmp/
+drivelite
+coverage.txt
+*.md
+!README.md
+docker-compose.yml
+Makefile
+.editorconfig
+.DS_Store

@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Format and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+          echo "All files are formatted."
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.23', '1.24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Test with race detector
+        run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.txt | tail -1
+          {
+            echo "### Coverage (Go ${{ matrix.go }})"
+            echo '```'
+            go tool cover -func=coverage.txt | tail -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Build every target
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            echo "building $os/$arch"
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o /dev/null .
+          done
+
+  docker:
+    name: Docker image smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: drivelite:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the container and exercise it
+        run: |
+          set -euo pipefail
+
+          mkdir -p share/photos
+          echo "hello" > share/photos/note.txt
+
+          docker run -d --name drivelite-ci -p 8080:8080 \
+            -v "$PWD/share:/data:ro" \
+            -e DRIVELITE_PASSWORD=ci-password \
+            drivelite:ci
+
+          # Wait for the health check rather than sleeping a fixed amount.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then break; fi
+            if [ "$i" = 30 ]; then
+              echo "::error::container never became healthy"
+              docker logs drivelite-ci
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- health"
+          test "$(curl -fsS http://127.0.0.1:8080/healthz)" = "ok"
+
+          echo "--- unauthenticated access is refused"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/browse)
+          test "$code" = "401"
+
+          echo "--- authenticated listing works"
+          curl -fsS -u admin:ci-password http://127.0.0.1:8080/browse | grep -q photos
+
+          echo "--- traversal is blocked"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -u admin:ci-password \
+            --get --data-urlencode 'p=../../etc/passwd' http://127.0.0.1:8080/raw)
+          test "$code" = "404"
+
+          echo "--- refuses to start without credentials"
+          if docker run --rm -v "$PWD/share:/data:ro" drivelite:ci 2>&1 | grep -q 'no credentials configured'; then
+            echo "ok"
+          else
+            echo "::error::missing-password guard did not fire"
+            exit 1
+          fi
+
+          docker rm -f drivelite-ci

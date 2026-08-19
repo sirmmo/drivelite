@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://ingmmo.com/drivelite
+    about: Configuration reference, deployment recipes and security notes.
+  - name: Report a security vulnerability
+    url: https://github.com/sirmmo/drivelite/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.

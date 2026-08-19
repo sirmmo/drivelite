@@ -1,0 +1,35 @@
+{{define "login.html"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · {{.Title}}</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+</head>
+<body class="centered">
+{{template "icons"}}
+
+<form class="card login" method="post" action="/login">
+  <div class="logo">
+    <svg class="i big" aria-hidden="true"><use href="#i-drive"/></svg>
+  </div>
+  <h1>{{.Title}}</h1>
+  <p class="muted">Sign in to browse the shared folder.</p>
+
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+
+  <label for="username">Username</label>
+  <input id="username" name="username" type="text" autocomplete="username"
+         {{if .SoleUser}}placeholder="{{.SoleUser}}"{{end}} autofocus>
+
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+
+  <input type="hidden" name="next" value="{{.Next}}">
+  <button class="btn primary block" type="submit">Sign in</button>
+</form>
+
+</body>
+</html>
+{{end}}

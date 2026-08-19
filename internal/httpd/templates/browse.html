@@ -1,0 +1,168 @@
+{{define "browse.html"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{if .Path}}{{.Heading}} · {{end}}{{.Title}}</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+{{template "icons"}}
+
+<header class="topbar">
+  <a class="brand" href="/browse">
+    <svg class="i" aria-hidden="true"><use href="#i-drive"/></svg>
+    <span>{{.Title}}</span>
+  </a>
+
+  <form class="search" method="get" action="/search" role="search">
+    <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+    <input type="search" name="q" value="{{.Query}}" placeholder="Search in this folder…"
+           aria-label="Search files" autocomplete="off">
+    <input type="hidden" name="p" value="{{.Path}}">
+  </form>
+
+  <div class="who">
+    {{if not .Anonymous}}
+      <span class="user" title="Signed in as {{.User}}">{{.User}}</span>
+      <form method="post" action="/logout">
+        <button type="submit" class="btn ghost" title="Sign out">
+          <svg class="i" aria-hidden="true"><use href="#i-logout"/></svg>
+          <span class="wide-only">Sign out</span>
+        </button>
+      </form>
+    {{else}}
+      <span class="user muted">public</span>
+    {{end}}
+  </div>
+</header>
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  {{range $i, $c := .Crumbs}}
+    {{if $i}}<svg class="sep" aria-hidden="true"><use href="#i-chevron"/></svg>{{end}}
+    {{if $c.Last}}<span class="crumb current" aria-current="page">{{$c.Name}}</span>
+    {{else}}<a class="crumb" href="{{$c.URL}}">{{$c.Name}}</a>{{end}}
+  {{end}}
+</nav>
+
+<div class="toolbar">
+  <div class="stats">
+    {{if .IsSearch}}
+      <strong>{{.Heading}}</strong>
+      {{if .Truncated}}<span class="badge">first 400 shown</span>{{end}}
+    {{else}}
+      {{.Folders}} folder{{if ne .Folders 1}}s{{end}} ·
+      {{.Files}} file{{if ne .Files 1}}s{{end}}
+      {{if .Files}}· {{.TotalSize}}{{end}}
+    {{end}}
+  </div>
+
+  <div class="actions">
+    <form class="sorter" method="get" action="{{if .IsSearch}}/search{{else}}/browse{{end}}">
+      <input type="hidden" name="p" value="{{.Path}}">
+      {{if .IsSearch}}<input type="hidden" name="q" value="{{.Query}}">{{end}}
+      <label class="sr-only" for="sort">Sort by</label>
+      <select id="sort" name="sort" data-autosubmit>
+        <option value="name" {{if eq .Sort "name"}}selected{{end}}>Name</option>
+        <option value="date" {{if eq .Sort "date"}}selected{{end}}>Modified</option>
+        <option value="size" {{if eq .Sort "size"}}selected{{end}}>Size</option>
+      </select>
+      <label class="sr-only" for="dir">Direction</label>
+      <select id="dir" name="dir" data-autosubmit>
+        <option value="asc" {{if eq .Dir "asc"}}selected{{end}}>Ascending</option>
+        <option value="desc" {{if eq .Dir "desc"}}selected{{end}}>Descending</option>
+      </select>
+      <noscript><button class="btn" type="submit">Apply</button></noscript>
+    </form>
+
+    <div class="viewtoggle" role="group" aria-label="View mode">
+      <button class="btn icon" data-view="grid" aria-pressed="{{if eq .View "grid"}}true{{else}}false{{end}}" title="Grid view">
+        <svg class="i" aria-hidden="true"><use href="#i-grid"/></svg>
+      </button>
+      <button class="btn icon" data-view="list" aria-pressed="{{if eq .View "list"}}true{{else}}false{{end}}" title="List view">
+        <svg class="i" aria-hidden="true"><use href="#i-list"/></svg>
+      </button>
+    </div>
+
+    {{if and .EnableZip (not .IsSearch)}}
+      <a class="btn primary" href="{{.ZipURL}}" title="Download this folder as a ZIP archive">
+        <svg class="i" aria-hidden="true"><use href="#i-download"/></svg>
+        <span class="wide-only">Download folder</span>
+      </a>
+    {{end}}
+  </div>
+</div>
+
+<main id="app" class="content" data-view="{{.View}}">
+  {{if .HasParent}}
+    <a class="up" href="{{.ParentURL}}">
+      <svg class="i" aria-hidden="true"><use href="#i-up"/></svg> Back
+    </a>
+  {{end}}
+
+  {{if not .Entries}}
+    <div class="empty">
+      <svg class="i big" aria-hidden="true"><use href="#i-empty"/></svg>
+      <p>{{if .IsSearch}}Nothing matched that search.{{else}}This folder is empty.{{end}}</p>
+    </div>
+  {{else}}
+    <ul class="items {{.View}}">
+      {{range $i, $e := .Entries}}
+        <li class="item {{$e.Kind}}"
+            data-kind="{{$e.Kind}}"
+            {{if not $e.IsDir}}
+              data-media="{{$e.RawURL}}"
+              data-dl="{{$e.DlURL}}"
+              data-name="{{$e.Name}}"
+              data-playable="{{if $e.Playable}}1{{else}}0{{end}}"
+            {{end}}>
+          <a class="hit" href="{{$e.URL}}" title="{{$e.Name}}">
+            <span class="thumb">
+              {{if $e.ThumbURL}}
+                <img src="{{$e.ThumbURL}}" alt="" loading="lazy" decoding="async">
+              {{else}}
+                <svg class="i tile" aria-hidden="true"><use href="#i-{{$e.Icon}}"/></svg>
+              {{end}}
+              {{if eq $e.Kind "video"}}<span class="playbadge"><svg class="i" aria-hidden="true"><use href="#i-play"/></svg></span>{{end}}
+            </span>
+            <span class="meta">
+              <span class="name">{{$e.Name}}</span>
+              <span class="sub">{{if $e.IsDir}}Folder{{else}}{{$e.SizeText}}{{end}} · {{$e.ModText}}</span>
+            </span>
+          </a>
+          {{if not $e.IsDir}}
+            <a class="grab" href="{{$e.DlURL}}" title="Download {{$e.Name}}" aria-label="Download {{$e.Name}}">
+              <svg class="i" aria-hidden="true"><use href="#i-download"/></svg>
+            </a>
+          {{end}}
+        </li>
+      {{end}}
+    </ul>
+  {{end}}
+</main>
+
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lb-bar">
+    <span class="lb-title" id="lb-title"></span>
+    <span class="lb-count" id="lb-count"></span>
+    <a class="btn ghost" id="lb-dl" href="#" title="Download">
+      <svg class="i" aria-hidden="true"><use href="#i-download"/></svg>
+    </a>
+    <button class="btn ghost" id="lb-close" title="Close (Esc)">
+      <svg class="i" aria-hidden="true"><use href="#i-close"/></svg>
+    </button>
+  </div>
+  <button class="lb-nav prev" id="lb-prev" title="Previous (←)" aria-label="Previous">
+    <svg class="i" aria-hidden="true"><use href="#i-chevron"/></svg>
+  </button>
+  <div class="lb-stage" id="lb-stage"></div>
+  <button class="lb-nav next" id="lb-next" title="Next (→)" aria-label="Next">
+    <svg class="i" aria-hidden="true"><use href="#i-chevron"/></svg>
+  </button>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

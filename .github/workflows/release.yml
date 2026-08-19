@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  image:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+          labels: |
+            org.opencontainers.image.title=drivelite
+            org.opencontainers.image.description=Browse and download a mounted folder through a Drive-like web UI
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  binaries:
+    name: Attach binaries to the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Build release archives
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            name="drivelite_${version}_${os}_${arch}"
+            out="build/$name"
+            mkdir -p "$out"
+
+            bin="$out/drivelite"
+            [ "$os" = "windows" ] && bin="$out/drivelite.exe"
+
+            GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags="-s -w -X main.version=${version}" -o "$bin" .
+
+            cp README.md LICENSE "$out/"
+
+            if [ "$os" = "windows" ]; then
+              (cd build && zip -qr "../dist/$name.zip" "$name")
+            else
+              tar -czf "dist/$name.tar.gz" -C build "$name"
+            fi
+          done
+
+          (cd dist && sha256sum * > checksums.txt)
+          ls -la dist
+
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+
+          if ! gh release view "$version" >/dev/null 2>&1; then
+            gh release create "$version" \
+              --title "$version" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+          gh release upload "$version" dist/* --clobber

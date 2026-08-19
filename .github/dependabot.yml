@@ -1,0 +1,25 @@
+version: 2
+
+updates:
+  # drivelite has no third-party Go modules today, but this keeps the
+  # toolchain directive and any future dependency current.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'deps'
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'ci'
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'docker'
