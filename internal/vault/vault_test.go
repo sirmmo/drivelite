@@ -38,6 +38,18 @@ func newTestVault(t *testing.T) (*Vault, string) {
 	return New(root), root
 }
 
+// within reports whether abs is root or sits underneath it. filepath.Rel is
+// used rather than a string prefix so that path boundaries are respected:
+// "/data-other" must not count as being inside "/data".
+func within(t *testing.T, root, abs string) bool {
+	t.Helper()
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
 func mustWrite(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
@@ -106,7 +118,7 @@ func TestResolveContainment(t *testing.T) {
 			t.Errorf("Resolve(%q) unexpected error: %v", ok, err)
 			continue
 		}
-		if abs != root && !filepath.HasPrefix(abs, root) {
+		if !within(t, root, abs) {
 			t.Errorf("Resolve(%q) = %q, escaped root %q", ok, abs, root)
 		}
 	}

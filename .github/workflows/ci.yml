@@ -149,11 +149,25 @@ jobs:
           test "$code" = "404"
 
           echo "--- refuses to start without credentials"
-          if docker run --rm -v "$PWD/share:/data:ro" drivelite:ci 2>&1 | grep -q 'no credentials configured'; then
-            echo "ok"
-          else
-            echo "::error::missing-password guard did not fire"
+          # Capture the output rather than piping straight into grep, so a
+          # failure here shows what the container actually said.
+          set +e
+          guard_output=$(docker run --rm -v "$PWD/share:/data:ro" drivelite:ci 2>&1)
+          guard_status=$?
+          set -e
+
+          echo "exit status: $guard_status"
+          echo "output:"
+          echo "$guard_output" | sed 's/^/  | /'
+
+          if [ "$guard_status" -eq 0 ]; then
+            echo "::error::container started with no credentials configured"
             exit 1
           fi
+          if ! printf '%s' "$guard_output" | grep -q 'no credentials configured'; then
+            echo "::error::exited non-zero but not for the expected reason"
+            exit 1
+          fi
+          echo "ok"
 
           docker rm -f drivelite-ci
