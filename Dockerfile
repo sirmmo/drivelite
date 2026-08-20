@@ -22,7 +22,10 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # ---- runtime ----
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates wget tzdata \
+# git is needed only by the git backend, but installing it unconditionally
+# keeps a single image for all three backends. It costs about 10 MB once its
+# dependencies (curl, pcre2, expat) are pulled in: 20 MB -> 30 MB.
+RUN apk add --no-cache ca-certificates wget tzdata git \
  && addgroup -g 65532 -S app \
  && adduser -u 65532 -S -G app app \
  && mkdir -p /data /cache \

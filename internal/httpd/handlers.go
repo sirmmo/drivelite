@@ -2,26 +2,24 @@ package httpd
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"drivelite/internal/vault"
+	"drivelite/internal/source"
 )
 
-// viewEntry decorates a vault entry with everything the template needs.
+// viewEntry decorates an entry with everything the template needs.
 type viewEntry struct {
-	vault.Entry
+	source.Entry
 	URL      string // where a click leads
 	RawURL   string
 	DlURL    string
@@ -42,6 +40,7 @@ type browsePage struct {
 	Heading   string
 	User      string
 	Anonymous bool
+	Backend   string
 	Path      string
 	Crumbs    []crumb
 	Entries   []viewEntry
@@ -75,32 +74,33 @@ func assetURL(base, p string) string {
 	return base + "?p=" + strings.ReplaceAll(url.QueryEscape(p), "+", "%20")
 }
 
-func (s *Server) decorate(e vault.Entry) viewEntry {
+func (s *Server) decorate(e source.Entry) viewEntry {
 	v := viewEntry{Entry: e}
+	if e.ModUnix > 0 {
+		v.ModText = time.Unix(e.ModUnix, 0).Format("2 Jan 2006")
+	}
 	if e.IsDir {
 		v.URL = assetURL("/browse", e.Path)
 		v.Icon = "folder"
-		v.ModText = time.Unix(e.ModUnix, 0).Format("2 Jan 2006")
 		return v
 	}
 	v.RawURL = assetURL("/raw", e.Path)
 	v.DlURL = assetURL("/dl", e.Path)
 	v.URL = v.DlURL
 	v.SizeText = humanSize(e.Size)
-	v.ModText = time.Unix(e.ModUnix, 0).Format("2 Jan 2006")
 	if e.Previewable {
 		v.ThumbURL = assetURL("/thumb", e.Path)
 	}
 	switch e.Kind {
-	case vault.KindImage:
+	case source.KindImage:
 		v.Icon = "image"
-	case vault.KindVideo:
+	case source.KindVideo:
 		v.Icon = "video"
-	case vault.KindAudio:
+	case source.KindAudio:
 		v.Icon = "audio"
-	case vault.KindPDF:
+	case source.KindPDF:
 		v.Icon = "pdf"
-	case vault.KindText:
+	case source.KindText:
 		v.Icon = "text"
 	default:
 		v.Icon = "file"
@@ -117,11 +117,7 @@ func crumbsFor(p string) []crumb {
 	parts := strings.Split(p, "/")
 	acc := ""
 	for i, part := range parts {
-		if acc == "" {
-			acc = part
-		} else {
-			acc = acc + "/" + part
-		}
+		acc = source.Join(acc, part)
 		out = append(out, crumb{Name: part, URL: assetURL("/browse", acc), Last: i == len(parts)-1})
 	}
 	return out
@@ -158,37 +154,38 @@ func persistPrefs(w http.ResponseWriter, sortMode, dir, view string) {
 }
 
 func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
-	rel := vault.Clean(r.URL.Query().Get("p"))
+	ctx := r.Context()
+	rel := source.Clean(r.URL.Query().Get("p"))
 
-	abs, info, err := s.vault.Stat(rel)
+	entry, err := s.src.Stat(ctx, rel)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	// Asking to browse a file just shows its parent instead of erroring.
-	if !info.IsDir() {
-		http.Redirect(w, r, assetURL("/browse", path.Dir(rel)), http.StatusSeeOther)
+	if !entry.IsDir {
+		http.Redirect(w, r, assetURL("/browse", source.Parent(rel)), http.StatusSeeOther)
 		return
 	}
-	_ = abs
 
 	sortMode, dir, view := prefs(r)
-	entries, err := s.vault.List(rel, vault.SortMode(sortMode), dir == "desc")
+	entries, err := s.src.List(ctx, rel)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	source.Sort(entries, source.SortMode(sortMode), dir == "desc")
 	persistPrefs(w, sortMode, dir, view)
 
 	page := s.buildPage(r, rel, entries, sortMode, dir, view)
 	page.Heading = "Home"
 	if rel != "" {
-		page.Heading = path.Base(rel)
+		page.Heading = source.Base(rel)
 	}
 	s.render(w, r, "browse.html", page)
 }
 
-func (s *Server) buildPage(r *http.Request, rel string, entries []vault.Entry, sortMode, dir, view string) *browsePage {
+func (s *Server) buildPage(r *http.Request, rel string, entries []source.Entry, sortMode, dir, view string) *browsePage {
 	user, _ := s.auth.Identify(r)
 
 	views := make([]viewEntry, 0, len(entries))
@@ -208,6 +205,7 @@ func (s *Server) buildPage(r *http.Request, rel string, entries []vault.Entry, s
 		Title:     s.cfg.Title,
 		User:      user,
 		Anonymous: s.auth.Anonymous(),
+		Backend:   s.src.Name(),
 		Path:      rel,
 		Crumbs:    crumbsFor(rel),
 		Entries:   views,
@@ -222,75 +220,70 @@ func (s *Server) buildPage(r *http.Request, rel string, entries []vault.Entry, s
 	}
 	if rel != "" {
 		p.HasParent = true
-		parent := path.Dir(rel)
-		if parent == "." {
-			parent = ""
-		}
-		p.ParentURL = assetURL("/browse", parent)
+		p.ParentURL = assetURL("/browse", source.Parent(rel))
 	}
 	return p
 }
 
 // handleSearch walks the tree below a folder looking for name matches.
+//
+// Walk reports files only — that is the model S3 imposes, since its
+// "directories" are just shared key prefixes. Folder matches are therefore
+// derived from the ancestors of matching paths, which keeps behaviour
+// identical across all three backends.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	const maxResults = 400
 
+	ctx := r.Context()
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	rel := vault.Clean(r.URL.Query().Get("p"))
+	rel := source.Clean(r.URL.Query().Get("p"))
 	if query == "" {
 		http.Redirect(w, r, assetURL("/browse", rel), http.StatusSeeOther)
 		return
 	}
 
-	abs, _, err := s.vault.Stat(rel)
-	if err != nil {
+	if _, err := s.src.Stat(ctx, rel); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 
 	needle := strings.ToLower(query)
-	var found []vault.Entry
+	var found []source.Entry
+	seenDirs := map[string]bool{}
 	truncated := false
 
-	err = filepath.WalkDir(abs, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil // unreadable subtree: skip rather than abort the search
-		}
-		if strings.HasPrefix(d.Name(), ".") {
-			if d.IsDir() && p != abs {
-				return fs.SkipDir
+	errStop := errors.New("enough results")
+	err := s.src.Walk(ctx, rel, func(e source.Entry) error {
+		// Any ancestor folder whose own name matches counts as a hit.
+		for dir := source.Parent(e.Path); dir != "" && dir != rel; dir = source.Parent(dir) {
+			if seenDirs[dir] {
+				break
 			}
-			if !d.IsDir() {
-				return nil
+			seenDirs[dir] = true
+			if strings.Contains(strings.ToLower(source.Base(dir)), needle) {
+				found = append(found, source.Entry{
+					Name: source.Base(dir), Path: dir, IsDir: true, Kind: source.KindFolder,
+				})
 			}
 		}
-		if p == abs || !strings.Contains(strings.ToLower(d.Name()), needle) {
-			return nil
+
+		if strings.Contains(strings.ToLower(e.Name), needle) {
+			found = append(found, e)
 		}
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		if !fi.IsDir() && !fi.Mode().IsRegular() {
-			return nil
-		}
-		childRel, err := s.vault.RelOf(p)
-		if err != nil {
-			return nil
-		}
-		found = append(found, describeFor(d.Name(), childRel, fi))
 		if len(found) >= maxResults {
 			truncated = true
-			return fs.SkipAll
+			return errStop
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errStop) {
 		s.fail(w, r, err)
 		return
 	}
 
 	sortMode, dir, view := prefs(r)
+	source.Sort(found, source.SortMode(sortMode), dir == "desc")
+
 	page := s.buildPage(r, rel, found, sortMode, dir, view)
 	page.IsSearch = true
 	page.Query = query
@@ -301,97 +294,64 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "browse.html", page)
 }
 
-// describeFor mirrors vault's entry construction for search hits.
-func describeFor(name, rel string, fi os.FileInfo) vault.Entry {
-	e := vault.Entry{
-		Name: name, Path: rel, IsDir: fi.IsDir(), ModUnix: fi.ModTime().Unix(),
-	}
-	if fi.IsDir() {
-		e.Kind = vault.KindFolder
-		return e
-	}
-	e.Size = fi.Size()
-	e.MimeType = vault.MimeOf(name)
-	e.Previewable = vault.Decodable(name)
-	switch {
-	case strings.HasPrefix(e.MimeType, "image/"):
-		e.Kind = vault.KindImage
-	case strings.HasPrefix(e.MimeType, "video/"):
-		e.Kind = vault.KindVideo
-	case strings.HasPrefix(e.MimeType, "audio/"):
-		e.Kind = vault.KindAudio
-	case e.MimeType == "application/pdf":
-		e.Kind = vault.KindPDF
-	case strings.HasPrefix(e.MimeType, "text/"):
-		e.Kind = vault.KindText
-	default:
-		e.Kind = vault.KindOther
-	}
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".mp4", ".m4v", ".webm", ".ogv", ".mp3", ".m4a", ".ogg", ".wav", ".flac", ".opus":
-		e.Playable = true
-	}
-	return e
-}
-
 func (s *Server) handleAPIList(w http.ResponseWriter, r *http.Request) {
-	rel := vault.Clean(r.URL.Query().Get("p"))
+	ctx := r.Context()
+	rel := source.Clean(r.URL.Query().Get("p"))
 	sortMode, dir, _ := prefs(r)
-	entries, err := s.vault.List(rel, vault.SortMode(sortMode), dir == "desc")
+
+	entries, err := s.src.List(ctx, rel)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	source.Sort(entries, source.SortMode(sortMode), dir == "desc")
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"path": rel, "entries": entries})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"backend": s.src.Name(),
+		"path":    rel,
+		"entries": entries,
+	})
 }
 
-// serveFile streams a regular file with Range support.
+// serveFile streams a file with Range support.
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, attachment bool) {
-	rel := vault.Clean(r.URL.Query().Get("p"))
-	abs, info, err := s.vault.Stat(rel)
+	ctx := r.Context()
+	rel := source.Clean(r.URL.Query().Get("p"))
+
+	entry, err := s.src.Stat(ctx, rel)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	if info.IsDir() {
+	if entry.IsDir {
 		s.fail(w, r, errors.New("cannot download a directory directly"))
 		return
 	}
 
-	f, err := os.Open(abs)
+	f, err := s.src.Open(ctx, rel)
 	if err != nil {
-		s.fail(w, r, vault.ErrNotFound)
+		s.fail(w, r, err)
 		return
 	}
 	defer f.Close()
 
-	name := filepath.Base(abs)
-	mimeType := vault.MimeOf(name)
-	kind := "other"
-	switch {
-	case strings.HasPrefix(mimeType, "image/"):
-		kind = "image"
-	case strings.HasPrefix(mimeType, "video/"):
-		kind = "video"
-	case strings.HasPrefix(mimeType, "audio/"):
-		kind = "audio"
-	case mimeType == "application/pdf":
-		kind = "pdf"
-	}
-
 	// Only media is ever served inline. Anything else — HTML, SVG, scripts —
 	// is forced to download so it cannot execute in this origin.
-	inline := !attachment && kind != "other" && mimeType != "image/svg+xml"
+	inline := !attachment && entry.Kind != source.KindOther &&
+		entry.Kind != source.KindText && entry.MimeType != "image/svg+xml"
 	disp := "attachment"
 	if inline {
 		disp = "inline"
 	}
 
-	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", contentDisposition(disp, name))
+	w.Header().Set("Content-Type", entry.MimeType)
+	w.Header().Set("Content-Disposition", contentDisposition(disp, entry.Name))
 	w.Header().Set("Cache-Control", "private, max-age=300")
-	http.ServeContent(w, r, name, info.ModTime(), f)
+	if entry.CacheTag != "" {
+		w.Header().Set("ETag", `"`+entry.CacheTag+`"`)
+	}
+	http.ServeContent(w, r, entry.Name, time.Unix(entry.ModUnix, 0), f)
 }
 
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
@@ -403,13 +363,15 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	rel := vault.Clean(r.URL.Query().Get("p"))
-	abs, info, err := s.vault.Stat(rel)
+	ctx := r.Context()
+	rel := source.Clean(r.URL.Query().Get("p"))
+
+	entry, err := s.src.Stat(ctx, rel)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	if info.IsDir() || !vault.Decodable(filepath.Base(abs)) {
+	if entry.IsDir || !entry.Previewable {
 		http.Error(w, "no preview available", http.StatusNotFound)
 		return
 	}
@@ -421,13 +383,21 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	thumbPath, err := s.thumb.Get(abs, info.ModTime().Unix(), info.Size(), edge)
+	// The identity must change when the bytes change, but stay stable across
+	// restarts and (for git) across commits that did not touch this file.
+	identity := s.scope() + "|" + entry.Path + "|" + entry.CacheTag
+
+	thumbPath, err := s.thumb.Get(identity, edge, func() (io.ReadCloser, error) {
+		return s.src.Open(ctx, rel)
+	})
 	if err != nil {
 		s.log.Warn("thumbnail failed", "path", rel, "err", err)
 		http.Error(w, "no preview available", http.StatusNotFound)
 		return
 	}
 
+	// The generated thumbnail always lives on the local cache disk, whatever
+	// the backing store is.
 	f, err := os.Open(thumbPath)
 	if err != nil {
 		http.Error(w, "no preview available", http.StatusNotFound)
@@ -443,6 +413,19 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "private, max-age=86400")
 	http.ServeContent(w, r, "thumb.jpg", fi.ModTime(), f)
+}
+
+// scope identifies the backing store, so thumbnails cached for one source are
+// never reused for another.
+func (s *Server) scope() string {
+	switch s.cfg.Backend {
+	case "s3":
+		return "s3|" + s.cfg.S3.Bucket + "|" + s.cfg.S3.Prefix
+	case "git":
+		return "git|" + s.cfg.Git.URL + "|" + s.cfg.Git.Subdir
+	default:
+		return "local|" + s.cfg.Root
+	}
 }
 
 // storeExt lists formats that are already compressed; re-deflating them in a
@@ -461,27 +444,34 @@ func (s *Server) handleZip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rel := vault.Clean(r.URL.Query().Get("p"))
-	abs, info, err := s.vault.Stat(rel)
+	ctx := r.Context()
+	rel := source.Clean(r.URL.Query().Get("p"))
+
+	entry, err := s.src.Stat(ctx, rel)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	if !info.IsDir() {
+	if !entry.IsDir {
 		http.Redirect(w, r, assetURL("/dl", rel), http.StatusSeeOther)
 		return
 	}
 
 	if s.cfg.MaxZipMB > 0 {
 		limit := s.cfg.MaxZipMB << 20
-		if _, _, over := s.vault.DirSize(abs, limit); over {
+		over, err := s.exceedsLimit(ctx, rel, limit)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if over {
 			http.Error(w, fmt.Sprintf("folder exceeds the %d MB archive limit", s.cfg.MaxZipMB),
 				http.StatusRequestEntityTooLarge)
 			return
 		}
 	}
 
-	name := path.Base(rel)
+	name := source.Base(rel)
 	if rel == "" {
 		name = "drive"
 	}
@@ -489,41 +479,23 @@ func (s *Server) handleZip(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", contentDisposition("attachment", name+".zip"))
 	// Length is unknown up front; the archive streams out as it is built.
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	zw := zip.NewWriter(w)
 	defer zw.Close()
 
-	walkErr := filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if strings.HasPrefix(d.Name(), ".") {
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		fi, err := d.Info()
-		if err != nil || !fi.Mode().IsRegular() {
+	walkErr := s.src.Walk(ctx, rel, func(e source.Entry) error {
+		inner := strings.TrimPrefix(e.Path, rel)
+		inner = strings.TrimPrefix(inner, "/")
+		if inner == "" {
 			return nil
 		}
 
-		inner, err := filepath.Rel(abs, p)
-		if err != nil {
-			return nil
+		hdr := &zip.FileHeader{
+			Name:     inner,
+			Method:   zip.Deflate,
+			Modified: time.Unix(e.ModUnix, 0),
 		}
-
-		hdr, err := zip.FileInfoHeader(fi)
-		if err != nil {
-			return nil
-		}
-		hdr.Name = filepath.ToSlash(inner)
-		hdr.Method = zip.Deflate
-		if storeExt[strings.ToLower(filepath.Ext(p))] {
+		if storeExt[strings.ToLower(extOf(e.Name))] {
 			hdr.Method = zip.Store
 		}
 
@@ -531,8 +503,10 @@ func (s *Server) handleZip(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err // client disconnected
 		}
-		src, err := os.Open(p)
+		src, err := s.src.Open(ctx, e.Path)
 		if err != nil {
+			// A file that vanished mid-archive should not abort the download.
+			s.log.Warn("skipping file in archive", "path", e.Path, "err", err)
 			return nil
 		}
 		defer src.Close()
@@ -542,6 +516,33 @@ func (s *Server) handleZip(w http.ResponseWriter, r *http.Request) {
 	if walkErr != nil {
 		s.log.Warn("zip stream ended early", "path", rel, "err", walkErr)
 	}
+}
+
+// exceedsLimit adds up a subtree, stopping as soon as the limit is passed.
+func (s *Server) exceedsLimit(ctx context.Context, dir string, limit int64) (bool, error) {
+	var total int64
+	over := false
+	stop := errors.New("over limit")
+
+	err := s.src.Walk(ctx, dir, func(e source.Entry) error {
+		total += e.Size
+		if total > limit {
+			over = true
+			return stop
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, stop) {
+		return false, err
+	}
+	return over, nil
+}
+
+func extOf(name string) string {
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return name[i:]
+	}
+	return ""
 }
 
 // ---- authentication ----
@@ -630,11 +631,13 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, vault.ErrForbidden):
+	case errors.Is(err, source.ErrForbidden):
 		s.log.Warn("blocked path", "query", r.URL.RawQuery, "remote", clientIP(r))
 		http.Error(w, "forbidden", http.StatusForbidden)
-	case errors.Is(err, vault.ErrNotFound):
+	case errors.Is(err, source.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, context.Canceled):
+		// The client went away; nothing to report.
 	default:
 		s.log.Error("request failed", "err", err, "query", r.URL.RawQuery)
 		http.Error(w, "internal error", http.StatusInternalServerError)

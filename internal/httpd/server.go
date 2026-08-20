@@ -14,8 +14,8 @@ import (
 
 	"drivelite/internal/auth"
 	"drivelite/internal/config"
+	"drivelite/internal/source"
 	"drivelite/internal/thumbs"
-	"drivelite/internal/vault"
 )
 
 //go:embed templates/*.html static/*
@@ -24,7 +24,7 @@ var assets embed.FS
 // Server holds everything the handlers need.
 type Server struct {
 	cfg   *config.Config
-	vault *vault.Vault
+	src   source.Source
 	auth  *auth.Authenticator
 	thumb *thumbs.Cache
 	tmpl  *template.Template
@@ -32,14 +32,14 @@ type Server struct {
 }
 
 // New builds a Server and parses the embedded templates.
-func New(cfg *config.Config, v *vault.Vault, a *auth.Authenticator, t *thumbs.Cache, log *slog.Logger) (*Server, error) {
+func New(cfg *config.Config, src source.Source, a *auth.Authenticator, t *thumbs.Cache, log *slog.Logger) (*Server, error) {
 	tmpl, err := template.New("").Funcs(template.FuncMap{
 		"humanSize": humanSize,
 	}).ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parsing templates: %w", err)
 	}
-	return &Server{cfg: cfg, vault: v, auth: a, thumb: t, tmpl: tmpl, log: log}, nil
+	return &Server{cfg: cfg, src: src, auth: a, thumb: t, tmpl: tmpl, log: log}, nil
 }
 
 // Handler returns the fully wired root handler.
@@ -79,8 +79,7 @@ func (s *Server) Handler() http.Handler {
 // page and answering API/asset requests with a plain 401.
 func (s *Server) protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, ok := s.auth.Identify(r)
-		if !ok {
+		if _, ok := s.auth.Identify(r); !ok {
 			if wantsHTML(r) {
 				dest := r.URL.RequestURI()
 				http.Redirect(w, r, "/login?next="+url.QueryEscape(dest), http.StatusSeeOther)
@@ -90,7 +89,6 @@ func (s *Server) protect(next http.Handler) http.Handler {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		_ = user
 		next.ServeHTTP(w, r)
 	})
 }

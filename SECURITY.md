@@ -25,7 +25,14 @@ These are treated as security bugs and are worth reporting:
 
 - **Path escape.** Any way to read a file outside the configured root — via
   `..`, encoding tricks, or a symlink pointing out of the tree. Containment is
-  checked lexically *and* again after symlink resolution.
+  checked lexically *and* again after symlink resolution. For the S3 backend
+  the configured prefix scopes every operation the same way.
+- **Reaching a hidden file.** Any path containing a dot-prefixed component is
+  refused outright, not merely omitted from listings. This matters most for
+  the git backend, where `.git/` holds repository internals.
+- **Leaking a git credential.** `DRIVELITE_GIT_TOKEN` is passed to git as a
+  per-command HTTP header, never written into the remote URL (and so never
+  into `.git/config`), and is redacted from logs and error output.
 - **Authentication bypass.** Reaching any protected route without valid
   credentials, forging or replaying a session cookie, or extending a session
   past its expiry.
@@ -47,8 +54,11 @@ These are known and intentional properties, not vulnerabilities:
 - **Plain HTTP by default.** drivelite does not terminate TLS. Run it behind a
   reverse proxy and set `DRIVELITE_SECURE_COOKIE=true`. Over plain HTTP the
   password and session cookie travel in the clear.
-- **Passwords come from the environment.** They are visible to anyone who can
-  read the process environment or your compose file. There is no secret store.
+- **Passwords and keys come from the environment.** The login password, S3
+  credentials and git token are visible to anyone who can read the process
+  environment or your compose file. There is no secret store.
+- **Anyone with the password sees the whole backend.** An S3 prefix or a git
+  subdirectory narrows what is served, but it is not a per-user permission.
 - **No brute-force lockout.** Login attempts are rate limited per IP (a burst
   of 8, refilling at one per 4s), which slows guessing but does not stop a
   determined distributed attempt. Use a strong password.

@@ -3,6 +3,7 @@
 package thumbs
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"image"
 	"image/draw"
 	"image/jpeg"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,17 +22,26 @@ import (
 	_ "image/png"
 )
 
-// ErrTooLarge guards against decoding absurd images into memory.
-var ErrTooLarge = errors.New("image dimensions exceed the decode limit")
+var (
+	// ErrTooLarge guards against decoding absurd images into memory.
+	ErrTooLarge = errors.New("image exceeds the decode limit")
+)
 
 // maxPixels caps decode work at roughly 80 megapixels.
 const maxPixels = 80_000_000
 
+// defaultMaxBytes bounds how much of a source image is read into memory.
+const defaultMaxBytes = 256 << 20
+
+// Opener yields the bytes of a source image. The caller closes the reader.
+type Opener func() (io.ReadCloser, error)
+
 // Cache renders thumbnails to a directory, one file per (source, size) pair.
 type Cache struct {
-	dir     string
-	maxEdge int
-	sem     chan struct{}
+	dir      string
+	maxEdge  int
+	maxBytes int64
+	sem      chan struct{}
 
 	mu       sync.Mutex
 	inFlight map[string]*sync.WaitGroup
@@ -55,24 +66,28 @@ func NewCache(dir string, maxEdge, workers int) (*Cache, error) {
 	return &Cache{
 		dir:      dir,
 		maxEdge:  maxEdge,
+		maxBytes: defaultMaxBytes,
 		sem:      make(chan struct{}, workers),
 		inFlight: map[string]*sync.WaitGroup{},
 	}, nil
 }
 
-// key derives a cache filename from the source identity and target size.
-func (c *Cache) key(absPath string, modUnix, size int64, edge int) string {
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%d|%d|%d", absPath, modUnix, size, edge))
+// keyFor derives a cache filename from a content identity and target size.
+//
+// The identity must change whenever the bytes change: local and git sources
+// pass modification time and size, S3 passes the object's ETag.
+func (c *Cache) keyFor(identity string, edge int) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%d", identity, edge))
 	return hex.EncodeToString(sum[:]) + ".jpg"
 }
 
 // Get returns the path of a cached thumbnail, generating it if necessary.
 // Concurrent requests for the same thumbnail collapse into one render.
-func (c *Cache) Get(absPath string, modUnix, size int64, edge int) (string, error) {
+func (c *Cache) Get(identity string, edge int, open Opener) (string, error) {
 	if edge <= 0 || edge > c.maxEdge {
 		edge = c.maxEdge
 	}
-	name := c.key(absPath, modUnix, size, edge)
+	name := c.keyFor(identity, edge)
 	dst := filepath.Join(c.dir, name)
 
 	if _, err := os.Stat(dst); err == nil {
@@ -104,38 +119,56 @@ func (c *Cache) Get(absPath string, modUnix, size int64, edge int) (string, erro
 	c.sem <- struct{}{}
 	defer func() { <-c.sem }()
 
-	if err := render(absPath, dst, edge); err != nil {
+	raw, err := c.read(open)
+	if err != nil {
+		return "", err
+	}
+	if err := c.render(raw, dst, edge); err != nil {
 		return "", err
 	}
 	return dst, nil
 }
 
-// render decodes one image, scales it down, and writes a JPEG thumbnail.
-func render(src, dst string, edge int) error {
-	f, err := os.Open(src)
+// read pulls the whole source image into memory, bounded by maxBytes.
+//
+// Decoding needs random access and the EXIF header has to be parsed from the
+// same bytes, so buffering is simpler than seeking — and it is the only
+// option for a remote object anyway.
+func (c *Cache) read(open Opener) ([]byte, error) {
+	rc, err := open()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer f.Close()
+	defer rc.Close()
 
-	cfg, _, err := image.DecodeConfig(f)
+	limited := io.LimitReader(rc, c.maxBytes+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("reading image: %w", err)
+	}
+	if int64(len(raw)) > c.maxBytes {
+		return nil, ErrTooLarge
+	}
+	return raw, nil
+}
+
+// render decodes one image, scales it down, and writes a JPEG thumbnail.
+func (c *Cache) render(raw []byte, dst string, edge int) error {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("reading image header: %w", err)
 	}
 	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > maxPixels {
 		return ErrTooLarge
 	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return err
-	}
 
-	img, _, err := image.Decode(f)
+	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("decoding image: %w", err)
 	}
 
 	// JPEGs from cameras and phones commonly rely on an EXIF orientation flag.
-	if orient := readOrientation(src); orient > 1 {
+	if orient := readOrientation(raw); orient > 1 {
 		img = applyOrientation(img, orient)
 	}
 
@@ -262,20 +295,15 @@ func applyOrientation(src image.Image, orient int) image.Image {
 	return dst
 }
 
-// readOrientation extracts the EXIF orientation tag (0x0112) from a JPEG.
+// readOrientation extracts the EXIF orientation tag (0x0112) from JPEG bytes.
 // It returns 1 (the no-op default) whenever the tag cannot be found.
-func readOrientation(path string) int {
-	f, err := os.Open(path)
-	if err != nil {
-		return 1
-	}
-	defer f.Close()
-
+func readOrientation(data []byte) int {
 	// EXIF lives in an APP1 segment near the start of the file.
-	head := make([]byte, 128*1024)
-	n, _ := f.Read(head)
-	head = head[:n]
-	if n < 4 || head[0] != 0xFF || head[1] != 0xD8 {
+	head := data
+	if len(head) > 128*1024 {
+		head = head[:128*1024]
+	}
+	if len(head) < 4 || head[0] != 0xFF || head[1] != 0xD8 {
 		return 1 // not a JPEG
 	}
 

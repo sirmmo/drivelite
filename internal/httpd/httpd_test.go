@@ -3,6 +3,7 @@ package httpd
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -14,30 +15,23 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"drivelite/internal/auth"
 	"drivelite/internal/config"
+	"drivelite/internal/source"
 	"drivelite/internal/thumbs"
-	"drivelite/internal/vault"
 )
 
 const testPassword = "s3cret"
 
-// newTestServer builds a server over a temporary tree containing a real JPEG,
-// a text file, an HTML file and a subfolder.
-func newTestServer(t *testing.T) (http.Handler, string) {
+// sampleTree is the fixture every backend under test is populated with.
+func sampleTree(t *testing.T) map[string][]byte {
 	t.Helper()
 
-	root := t.TempDir()
-	if resolved, err := filepath.EvalSymlinks(root); err == nil {
-		root = resolved
-	}
-	cacheDir := t.TempDir()
-
-	// A real JPEG, so thumbnail generation has something to decode.
 	img := image.NewRGBA(image.Rect(0, 0, 120, 90))
 	for y := range 90 {
 		for x := range 120 {
@@ -48,44 +42,185 @@ func newTestServer(t *testing.T) (http.Handler, string) {
 	if err := jpeg.Encode(&buf, img, nil); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(root, "photo.jpg"), buf.Bytes())
-	write(t, filepath.Join(root, "notes.txt"), []byte("plain text"))
-	write(t, filepath.Join(root, "page.html"), []byte("<script>alert(1)</script>"))
-	if err := os.Mkdir(filepath.Join(root, "trip"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	write(t, filepath.Join(root, "trip", "clip.mp4"), []byte("fake-mp4-bytes"))
 
-	cfg := &config.Config{
-		Root: root, CacheDir: cacheDir, Title: "Test Drive",
-		Users: map[string]string{"admin": testPassword}, SessionTTL: time.Hour,
-		ThumbPx: 200, ThumbJobs: 2, EnableZip: true,
-	}
-	cache, err := thumbs.NewCache(cacheDir, cfg.ThumbPx, cfg.ThumbJobs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := auth.New(cfg.Users, []byte("unit-test-key"), cfg.SessionTTL, false, false)
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	srv, err := New(cfg, vault.New(root), a, cache, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return srv.Handler(), root
-}
-
-func write(t *testing.T, path string, body []byte) {
-	t.Helper()
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		t.Fatal(err)
+	return map[string][]byte{
+		"photo.jpg":     buf.Bytes(),
+		"notes.txt":     []byte("plain text"),
+		"page.html":     []byte("<script>alert(1)</script>"),
+		"trip/clip.mp4": []byte("fake-mp4-bytes"),
 	}
 }
 
-// do issues a request with Basic auth unless anonymous is requested.
-func do(t *testing.T, h http.Handler, method, target string, authed bool) *http.Response {
+// newServer wires a Server around any source.
+func newServer(t *testing.T, src source.Source, cfg *config.Config) http.Handler {
 	t.Helper()
-	r := httptest.NewRequest(method, target, nil)
+	cache, err := thumbs.NewCache(t.TempDir(), cfg.ThumbPx, cfg.ThumbJobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := auth.New(cfg.Users, []byte("unit-test-key"), cfg.SessionTTL, false, cfg.Anonymous)
+	srv, err := New(cfg, src, a, cache, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv.Handler()
+}
+
+func baseConfig() *config.Config {
+	return &config.Config{
+		Backend:    config.BackendLocal,
+		Title:      "Test Drive",
+		Users:      map[string]string{"admin": testPassword},
+		SessionTTL: time.Hour, ThumbPx: 200, ThumbJobs: 2, EnableZip: true,
+	}
+}
+
+// newLocalServer materialises the fixture on disk and serves it.
+func newLocalServer(t *testing.T) http.Handler {
+	t.Helper()
+	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	for path, body := range sampleTree(t) {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src, err := source.NewLocal(root, "test folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	cfg.Root = root
+	return newServer(t, src, cfg)
+}
+
+// ---- an in-memory backend, to prove the handlers are not local-only ----
+
+type memSource struct{ files map[string][]byte }
+
+func (m *memSource) Name() string { return "memory" }
+func (m *memSource) Close() error { return nil }
+
+func (m *memSource) entry(path string) source.Entry {
+	return source.Describe(source.Entry{
+		Name: source.Base(path), Path: path,
+		Size: int64(len(m.files[path])), ModUnix: 1700000000,
+		CacheTag: "tag-" + path,
+	})
+}
+
+func (m *memSource) Stat(_ context.Context, name string) (source.Entry, error) {
+	name = source.Clean(name)
+	if name == "" {
+		return source.Entry{IsDir: true, Kind: source.KindFolder}, nil
+	}
+	if _, ok := m.files[name]; ok {
+		return m.entry(name), nil
+	}
+	for p := range m.files {
+		if strings.HasPrefix(p, name+"/") {
+			return source.Entry{Name: source.Base(name), Path: name,
+				IsDir: true, Kind: source.KindFolder}, nil
+		}
+	}
+	return source.Entry{}, source.ErrNotFound
+}
+
+func (m *memSource) List(_ context.Context, dir string) ([]source.Entry, error) {
+	dir = source.Clean(dir)
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	seen := map[string]bool{}
+	var out []source.Entry
+	for p := range m.files {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(p, prefix)
+		if i := strings.Index(rest, "/"); i >= 0 {
+			name := rest[:i]
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, source.Entry{Name: name, Path: source.Join(dir, name),
+					IsDir: true, Kind: source.KindFolder})
+			}
+			continue
+		}
+		out = append(out, m.entry(p))
+	}
+	return out, nil
+}
+
+func (m *memSource) Open(_ context.Context, name string) (source.File, error) {
+	body, ok := m.files[source.Clean(name)]
+	if !ok {
+		return nil, source.ErrNotFound
+	}
+	return &memFile{Reader: bytes.NewReader(body), size: int64(len(body))}, nil
+}
+
+func (m *memSource) Walk(_ context.Context, dir string, fn func(source.Entry) error) error {
+	dir = source.Clean(dir)
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	paths := make([]string, 0, len(m.files))
+	for p := range m.files {
+		if strings.HasPrefix(p, prefix) {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		if err := fn(m.entry(p)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type memFile struct {
+	*bytes.Reader
+	size int64
+}
+
+func (f *memFile) Size() int64  { return f.size }
+func (f *memFile) Close() error { return nil }
+
+func newMemServer(t *testing.T) http.Handler {
+	t.Helper()
+	files := map[string][]byte{}
+	for k, v := range sampleTree(t) {
+		files[k] = v
+	}
+	cfg := baseConfig()
+	cfg.Backend = config.BackendS3
+	cfg.S3.Bucket = "test-bucket"
+	return newServer(t, &memSource{files: files}, cfg)
+}
+
+// backends enumerates every wiring the handler tests run against.
+func backends(t *testing.T) map[string]http.Handler {
+	return map[string]http.Handler{
+		"local":  newLocalServer(t),
+		"memory": newMemServer(t),
+	}
+}
+
+// ---- helpers ----
+
+func do(t *testing.T, h http.Handler, target string, authed bool) *http.Response {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, target, nil)
 	r.Header.Set("Accept", "text/html")
 	if authed {
 		r.SetBasicAuth("admin", testPassword)
@@ -99,19 +234,19 @@ func pathURL(base, p string) string {
 	return base + "?p=" + strings.ReplaceAll(url.QueryEscape(p), "+", "%20")
 }
 
+// ---- tests ----
+
 func TestHealthzIsPublic(t *testing.T) {
-	h, _ := newTestServer(t)
-	res := do(t, h, http.MethodGet, "/healthz", false)
-	if res.StatusCode != http.StatusOK {
+	h := newLocalServer(t)
+	if res := do(t, h, "/healthz", false); res.StatusCode != http.StatusOK {
 		t.Errorf("healthz = %d, want 200", res.StatusCode)
 	}
 }
 
 func TestUnauthenticatedAccess(t *testing.T) {
-	h, _ := newTestServer(t)
+	h := newLocalServer(t)
 
-	// A browser navigation is redirected to the login page.
-	res := do(t, h, http.MethodGet, "/browse", false)
+	res := do(t, h, "/browse", false)
 	if res.StatusCode != http.StatusSeeOther {
 		t.Errorf("browse without auth = %d, want 303", res.StatusCode)
 	}
@@ -119,7 +254,6 @@ func TestUnauthenticatedAccess(t *testing.T) {
 		t.Errorf("redirect went to %q, want /login", loc)
 	}
 
-	// A non-browser client gets a plain 401 with a challenge.
 	r := httptest.NewRequest(http.MethodGet, "/raw?p=photo.jpg", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -132,7 +266,7 @@ func TestUnauthenticatedAccess(t *testing.T) {
 }
 
 func TestLoginFlow(t *testing.T) {
-	h, _ := newTestServer(t)
+	h := newLocalServer(t)
 
 	form := url.Values{"password": {testPassword}, "next": {"/browse"}}
 	r := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
@@ -153,7 +287,6 @@ func TestLoginFlow(t *testing.T) {
 		t.Fatal("no session cookie issued")
 	}
 
-	// The cookie alone must now grant access.
 	r2 := httptest.NewRequest(http.MethodGet, "/browse", nil)
 	r2.AddCookie(session)
 	w2 := httptest.NewRecorder()
@@ -162,7 +295,6 @@ func TestLoginFlow(t *testing.T) {
 		t.Errorf("browse with session = %d, want 200", w2.Code)
 	}
 
-	// A wrong password does not.
 	bad := url.Values{"password": {"nope"}}
 	r3 := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(bad.Encode()))
 	r3.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -174,48 +306,52 @@ func TestLoginFlow(t *testing.T) {
 }
 
 func TestBrowseListsEntries(t *testing.T) {
-	h, _ := newTestServer(t)
-	res := do(t, h, http.MethodGet, "/browse", true)
-	body, _ := io.ReadAll(res.Body)
-	page := string(body)
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			res := do(t, h, "/browse", true)
+			body, _ := io.ReadAll(res.Body)
+			page := string(body)
 
-	for _, want := range []string{"photo.jpg", "notes.txt", "trip"} {
-		if !strings.Contains(page, want) {
-			t.Errorf("listing is missing %q", want)
-		}
-	}
-	if !strings.Contains(page, "/thumb?p=photo.jpg") {
-		t.Error("no thumbnail link for the JPEG")
-	}
-	// The UI must stay free of inline script for the CSP to hold.
-	if strings.Contains(page, "<script>") {
-		t.Error("page contains an inline <script> block")
+			for _, want := range []string{"photo.jpg", "notes.txt", "trip"} {
+				if !strings.Contains(page, want) {
+					t.Errorf("listing is missing %q", want)
+				}
+			}
+			if !strings.Contains(page, "/thumb?p=photo.jpg") {
+				t.Error("no thumbnail link for the JPEG")
+			}
+			// The UI must stay free of inline script for the CSP to hold.
+			if strings.Contains(page, "<script>") {
+				t.Error("page contains an inline <script> block")
+			}
+		})
 	}
 }
 
 func TestPathTraversalBlocked(t *testing.T) {
-	h, _ := newTestServer(t)
-
-	for _, probe := range []string{
-		"../../etc/passwd",
-		"/etc/passwd",
-		"../../../../../../etc/passwd",
-		"trip/../../etc/passwd",
-	} {
-		res := do(t, h, http.MethodGet, pathURL("/raw", probe), true)
-		if res.StatusCode == http.StatusOK {
-			t.Errorf("traversal %q returned 200", probe)
-		}
-		body, _ := io.ReadAll(res.Body)
-		if strings.Contains(string(body), "root:") {
-			t.Fatalf("traversal %q leaked /etc/passwd", probe)
-		}
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, probe := range []string{
+				"../../etc/passwd",
+				"/etc/passwd",
+				"../../../../../../etc/passwd",
+				"trip/../../etc/passwd",
+				`..\..\etc\passwd`,
+			} {
+				res := do(t, h, pathURL("/raw", probe), true)
+				if res.StatusCode == http.StatusOK {
+					t.Errorf("traversal %q returned 200", probe)
+				}
+				body, _ := io.ReadAll(res.Body)
+				if strings.Contains(string(body), "root:") {
+					t.Fatalf("traversal %q leaked /etc/passwd", probe)
+				}
+			}
+		})
 	}
 }
 
-func TestContentDisposition(t *testing.T) {
-	h, _ := newTestServer(t)
-
+func TestContentDispositionAcrossBackends(t *testing.T) {
 	cases := []struct {
 		url, wantType, wantDisp string
 	}{
@@ -226,24 +362,27 @@ func TestContentDisposition(t *testing.T) {
 		{pathURL("/raw", "page.html"), "text/html", "attachment"},
 		{pathURL("/raw", "notes.txt"), "text/plain", "attachment"},
 	}
-	for _, c := range cases {
-		res := do(t, h, http.MethodGet, c.url, true)
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("%s = %d, want 200", c.url, res.StatusCode)
-			continue
-		}
-		if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, c.wantType) {
-			t.Errorf("%s Content-Type = %q, want %q", c.url, ct, c.wantType)
-		}
-		if cd := res.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, c.wantDisp) {
-			t.Errorf("%s Content-Disposition = %q, want %q", c.url, cd, c.wantDisp)
-		}
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, c := range cases {
+				res := do(t, h, c.url, true)
+				if res.StatusCode != http.StatusOK {
+					t.Errorf("%s = %d, want 200", c.url, res.StatusCode)
+					continue
+				}
+				if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, c.wantType) {
+					t.Errorf("%s Content-Type = %q, want %q", c.url, ct, c.wantType)
+				}
+				if cd := res.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, c.wantDisp) {
+					t.Errorf("%s Content-Disposition = %q, want %q", c.url, cd, c.wantDisp)
+				}
+			}
+		})
 	}
 }
 
 func TestSecurityHeaders(t *testing.T) {
-	h, _ := newTestServer(t)
-	res := do(t, h, http.MethodGet, "/browse", true)
+	res := do(t, newLocalServer(t), "/browse", true)
 
 	if got := res.Header.Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Errorf("X-Content-Type-Options = %q", got)
@@ -257,102 +396,158 @@ func TestSecurityHeaders(t *testing.T) {
 }
 
 func TestThumbnail(t *testing.T) {
-	h, _ := newTestServer(t)
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			res := do(t, h, pathURL("/thumb", "photo.jpg"), true)
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("thumb = %d, want 200", res.StatusCode)
+			}
+			if ct := res.Header.Get("Content-Type"); ct != "image/jpeg" {
+				t.Errorf("thumb Content-Type = %q", ct)
+			}
+			body, _ := io.ReadAll(res.Body)
+			if _, _, err := image.Decode(bytes.NewReader(body)); err != nil {
+				t.Errorf("thumbnail did not decode: %v", err)
+			}
 
-	res := do(t, h, http.MethodGet, pathURL("/thumb", "photo.jpg"), true)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("thumb = %d, want 200", res.StatusCode)
-	}
-	if ct := res.Header.Get("Content-Type"); ct != "image/jpeg" {
-		t.Errorf("thumb Content-Type = %q", ct)
-	}
-	body, _ := io.ReadAll(res.Body)
-	if _, _, err := image.Decode(bytes.NewReader(body)); err != nil {
-		t.Errorf("thumbnail did not decode: %v", err)
-	}
-
-	// Formats without a decoder have no preview.
-	if res := do(t, h, http.MethodGet, pathURL("/thumb", "notes.txt"), true); res.StatusCode != http.StatusNotFound {
-		t.Errorf("thumb of a text file = %d, want 404", res.StatusCode)
+			// Formats without a decoder have no preview.
+			if res := do(t, h, pathURL("/thumb", "notes.txt"), true); res.StatusCode != http.StatusNotFound {
+				t.Errorf("thumb of a text file = %d, want 404", res.StatusCode)
+			}
+		})
 	}
 }
 
 func TestRangeRequest(t *testing.T) {
-	h, _ := newTestServer(t)
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, pathURL("/raw", "trip/clip.mp4"), nil)
+			r.SetBasicAuth("admin", testPassword)
+			r.Header.Set("Range", "bytes=0-3")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
 
-	r := httptest.NewRequest(http.MethodGet, pathURL("/raw", "trip/clip.mp4"), nil)
-	r.SetBasicAuth("admin", testPassword)
-	r.Header.Set("Range", "bytes=0-3")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-
-	if w.Code != http.StatusPartialContent {
-		t.Errorf("range request = %d, want 206", w.Code)
-	}
-	if got := w.Body.Len(); got != 4 {
-		t.Errorf("range returned %d bytes, want 4", got)
+			if w.Code != http.StatusPartialContent {
+				t.Errorf("range request = %d, want 206", w.Code)
+			}
+			if got := w.Body.Len(); got != 4 {
+				t.Errorf("range returned %d bytes, want 4", got)
+			}
+		})
 	}
 }
 
 func TestZipFolder(t *testing.T) {
-	h, _ := newTestServer(t)
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			res := do(t, h, pathURL("/zip", "trip"), true)
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("zip = %d, want 200", res.StatusCode)
+			}
+			if ct := res.Header.Get("Content-Type"); ct != "application/zip" {
+				t.Errorf("zip Content-Type = %q", ct)
+			}
 
-	res := do(t, h, http.MethodGet, pathURL("/zip", "trip"), true)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("zip = %d, want 200", res.StatusCode)
-	}
-	if ct := res.Header.Get("Content-Type"); ct != "application/zip" {
-		t.Errorf("zip Content-Type = %q", ct)
-	}
-
-	body, _ := io.ReadAll(res.Body)
-	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
-	if err != nil {
-		t.Fatalf("archive is not readable: %v", err)
-	}
-	if len(zr.File) != 1 || zr.File[0].Name != "clip.mp4" {
-		t.Errorf("unexpected archive contents: %+v", zr.File)
+			body, _ := io.ReadAll(res.Body)
+			zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+			if err != nil {
+				t.Fatalf("archive is not readable: %v", err)
+			}
+			if len(zr.File) != 1 || zr.File[0].Name != "clip.mp4" {
+				var got []string
+				for _, f := range zr.File {
+					got = append(got, f.Name)
+				}
+				t.Errorf("unexpected archive contents: %v", got)
+			}
+		})
 	}
 }
 
 func TestSearch(t *testing.T) {
-	h, _ := newTestServer(t)
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			res := do(t, h, "/search?q=clip", true)
+			body, _ := io.ReadAll(res.Body)
+			if !strings.Contains(string(body), "clip.mp4") {
+				t.Error("search did not find clip.mp4 in a subfolder")
+			}
 
-	res := do(t, h, http.MethodGet, "/search?q=clip", true)
-	body, _ := io.ReadAll(res.Body)
-	if !strings.Contains(string(body), "clip.mp4") {
-		t.Error("search did not find clip.mp4 in a subfolder")
-	}
+			// A folder whose own name matches is reported too, even though
+			// Walk only ever visits files.
+			res = do(t, h, "/search?q=trip", true)
+			body, _ = io.ReadAll(res.Body)
+			if !strings.Contains(string(body), "trip") {
+				t.Error("search did not report the matching folder")
+			}
 
-	res = do(t, h, http.MethodGet, "/search?q=nothingmatches", true)
-	body, _ = io.ReadAll(res.Body)
-	if !strings.Contains(string(body), "Nothing matched") {
-		t.Error("empty search should show the empty state")
+			res = do(t, h, "/search?q=nothingmatches", true)
+			body, _ = io.ReadAll(res.Body)
+			if !strings.Contains(string(body), "Nothing matched") {
+				t.Error("empty search should show the empty state")
+			}
+		})
 	}
 }
 
 func TestAPIList(t *testing.T) {
-	h, _ := newTestServer(t)
-	res := do(t, h, http.MethodGet, "/api/list", true)
+	for name, h := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			res := do(t, h, "/api/list", true)
 
-	var payload struct {
-		Path    string        `json:"path"`
-		Entries []vault.Entry `json:"entries"`
+			var payload struct {
+				Backend string         `json:"backend"`
+				Path    string         `json:"path"`
+				Entries []source.Entry `json:"entries"`
+			}
+			if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+				t.Fatalf("decoding JSON: %v", err)
+			}
+			if len(payload.Entries) != 4 {
+				t.Errorf("got %d entries, want 4", len(payload.Entries))
+			}
+			if !payload.Entries[0].IsDir {
+				t.Error("folders should sort first in the API too")
+			}
+			if payload.Backend == "" {
+				t.Error("API response should name the backend")
+			}
+		})
 	}
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-		t.Fatalf("decoding JSON: %v", err)
+}
+
+func TestZipSizeLimit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "big.bin"), make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if len(payload.Entries) != 4 {
-		t.Errorf("got %d entries, want 4", len(payload.Entries))
+	src, err := source.NewLocal(root, "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !payload.Entries[0].IsDir {
-		t.Error("folders should sort first in the API too")
+	cfg := baseConfig()
+	cfg.Root = root
+	cfg.MaxZipMB = 1
+	h := newServer(t, src, cfg)
+
+	// 4 KB is under the 1 MB cap.
+	if res := do(t, h, "/zip", true); res.StatusCode != http.StatusOK {
+		t.Errorf("small zip = %d, want 200", res.StatusCode)
+	}
+
+	// Now make the cap impossible to satisfy.
+	cfg.MaxZipMB = 0
+	src2, _ := source.NewLocal(root, "")
+	cfg2 := baseConfig()
+	cfg2.Root = root
+	cfg2.EnableZip = false
+	if res := do(t, newServer(t, src2, cfg2), "/zip", true); res.StatusCode != http.StatusForbidden {
+		t.Errorf("disabled zip = %d, want 403", res.StatusCode)
 	}
 }
 
 func TestBrowsingAFileRedirectsToParent(t *testing.T) {
-	h, _ := newTestServer(t)
-	res := do(t, h, http.MethodGet, pathURL("/browse", "trip/clip.mp4"), true)
+	res := do(t, newLocalServer(t), pathURL("/browse", "trip/clip.mp4"), true)
 	if res.StatusCode != http.StatusSeeOther {
 		t.Errorf("browse of a file = %d, want 303", res.StatusCode)
 	}

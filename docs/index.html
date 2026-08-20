@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>drivelite — a Drive-like web UI for any folder</title>
-<meta name="description" content="A small Go service that turns any mounted folder into a browsable, downloadable gallery behind a minimal login. Single static binary, no dependencies, ~20 MB container image.">
+<title>drivelite — a Drive-like web UI for folders, git and S3</title>
+<meta name="description" content="A small Go service that exposes a local folder, a git repository, or an S3-compatible bucket as a browsable, downloadable gallery behind a minimal login. Single static binary, no dependencies.">
 <link rel="canonical" href="https://ingmmo.com/drivelite/">
 <meta property="og:title" content="drivelite">
-<meta property="og:description" content="Turn any mounted folder into a Drive-like gallery. Browse, preview, download — behind a minimal login.">
+<meta property="og:description" content="Expose a folder, a git repo, or an S3 bucket as a Drive-like gallery. Browse, preview, download — behind a minimal login.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://ingmmo.com/drivelite/">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%231a73e8'/%3E%3Cpath d='M9.2 4.5h5.6L20 13.2l-2.8 4.8H6.8L4 13.2 9.2 4.5Z' fill='none' stroke='%23fff' stroke-width='1.6' stroke-linejoin='round'/%3E%3C/svg%3E">
@@ -143,6 +143,7 @@ footer .row{display:flex;gap:20px;justify-content:center;flex-wrap:wrap;margin-b
     </a>
     <div class="links">
       <a href="#quick-start">Quick start</a>
+      <a href="#backends">Backends</a>
       <a href="#configuration">Config</a>
       <a href="#security" class="opt">Security</a>
       <a href="#api" class="opt">API</a>
@@ -153,16 +154,17 @@ footer .row{display:flex;gap:20px;justify-content:center;flex-wrap:wrap;margin-b
 
 <header class="hero" id="top">
   <div class="wrap">
-    <h1>Any folder, as a gallery</h1>
+    <h1>Any storage, as a gallery</h1>
     <p class="tag">
-      drivelite turns a mounted directory into a Google-Drive-style web UI:
-      browse folders, preview photos and video, download files or whole
-      folders — behind a minimal login.
+      drivelite exposes a folder, a git repository, or an S3-compatible bucket
+      as a Google-Drive-style web UI: browse, preview photos and video,
+      download files or whole folders — behind a minimal login.
     </p>
     <div class="pills">
+      <span class="pill">Folder · Git · S3</span>
       <span class="pill">Single static binary</span>
       <span class="pill">No Go dependencies</span>
-      <span class="pill">~20 MB image</span>
+      <span class="pill">~30 MB image</span>
       <span class="pill">amd64 + arm64</span>
       <span class="pill">MIT</span>
     </div>
@@ -233,6 +235,70 @@ DRIVELITE_PASSWORD=dev \
   </div>
 </section>
 
+<section id="backends">
+  <div class="wrap">
+    <h2>Three backends, one interface</h2>
+    <p class="lead">
+      Choose with <code>DRIVELITE_BACKEND</code>, or let it be inferred:
+      setting <code>DRIVELITE_S3_BUCKET</code> selects S3, setting
+      <code>DRIVELITE_GIT_URL</code> selects git, otherwise a local folder.
+    </p>
+
+    <h3>Local folder</h3>
+<pre><code>docker run -d -p 8080:8080 \
+  -v /srv/photos:/data:ro \
+  -e DRIVELITE_PASSWORD='secret' \
+  ghcr.io/sirmmo/drivelite:latest</code></pre>
+
+    <h3>Git repository</h3>
+    <p>
+      The repository is cloned into the cache directory and served from its
+      working tree, so thumbnails, ZIP downloads and search behave exactly as
+      they do for a folder. A background timer re-fetches; if a refresh fails,
+      the previous checkout keeps being served rather than the site going down.
+    </p>
+<pre><code>docker run -d -p 8080:8080 \
+  -e DRIVELITE_BACKEND=git \
+  -e DRIVELITE_GIT_URL=https://github.com/owner/repo.git \
+  -e DRIVELITE_GIT_REF=main \
+  -e DRIVELITE_GIT_INTERVAL=5m \
+  -e DRIVELITE_PASSWORD='secret' \
+  ghcr.io/sirmmo/drivelite:latest</code></pre>
+
+    <div class="note">
+      <strong>Private repositories keep their token off disk.</strong>
+      <code>DRIVELITE_GIT_TOKEN</code> is handed to git as a per-command HTTP
+      header rather than embedded in the remote URL. Embedding it would persist
+      the credential in <code>.git/config</code> — inside the very tree being
+      served.
+    </div>
+
+    <h3>S3-compatible bucket</h3>
+    <p>
+      Works with AWS S3, MinIO, Ceph, Garage, Backblaze B2 and Cloudflare R2.
+      Requests are signed with SigV4 implemented on the Go standard library, so
+      the AWS SDK is not a dependency. Range requests become ranged
+      <code>GET</code>s, which means video seeking works without pulling the
+      whole object down first.
+    </p>
+<pre><code>docker run -d -p 8080:8080 \
+  -e DRIVELITE_BACKEND=s3 \
+  -e DRIVELITE_S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com \
+  -e DRIVELITE_S3_BUCKET=my-photos \
+  -e DRIVELITE_S3_REGION=eu-west-1 \
+  -e DRIVELITE_S3_ACCESS_KEY=AKIA... \
+  -e DRIVELITE_S3_SECRET_KEY=... \
+  -e DRIVELITE_PASSWORD='secret' \
+  ghcr.io/sirmmo/drivelite:latest</code></pre>
+    <p style="font-size:14.5px;color:var(--muted)">
+      Leave the key and secret unset to read a public bucket anonymously.
+      S3 has no real directories — listing with a <code>/</code> delimiter makes
+      shared key prefixes appear as folders, and zero-length "folder marker"
+      objects are hidden.
+    </p>
+  </div>
+</section>
+
 <section id="features">
   <div class="wrap">
     <h2>What you get</h2>
@@ -272,11 +338,12 @@ DRIVELITE_PASSWORD=dev \
     <h2>Configuration</h2>
     <p class="lead">Everything is an environment variable. Only the password is required.</p>
 
+    <h3>Common</h3>
     <table>
       <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
       <tbody>
-        <tr><td><code>DRIVELITE_ROOT</code></td><td><code>/data</code></td><td>Folder to serve. Mount it read-only.</td></tr>
-        <tr><td><code>DRIVELITE_CACHE_DIR</code></td><td><code>/cache</code></td><td>Thumbnail cache. Must be outside <code>ROOT</code>.</td></tr>
+        <tr><td><code>DRIVELITE_BACKEND</code></td><td>inferred</td><td><code>local</code>, <code>git</code> or <code>s3</code>.</td></tr>
+        <tr><td><code>DRIVELITE_CACHE_DIR</code></td><td><code>/cache</code></td><td>Thumbnails and git checkouts. Must sit outside a local root.</td></tr>
         <tr><td><code>DRIVELITE_ADDR</code></td><td><code>:8080</code></td><td>Listen address.</td></tr>
         <tr><td><code>DRIVELITE_TITLE</code></td><td><code>Drive</code></td><td>Name shown in the header.</td></tr>
         <tr><td><code>DRIVELITE_PASSWORD</code></td><td>—</td><td>Password for the single account.</td></tr>
@@ -290,6 +357,45 @@ DRIVELITE_PASSWORD=dev \
         <tr><td><code>DRIVELITE_THUMB_JOBS</code></td><td><code>4</code></td><td>Concurrent thumbnail decodes.</td></tr>
         <tr><td><code>DRIVELITE_ENABLE_ZIP</code></td><td><code>true</code></td><td>Allow folder-as-ZIP downloads.</td></tr>
         <tr><td><code>DRIVELITE_MAX_ZIP_MB</code></td><td><code>0</code></td><td>Refuse archives above this size. <code>0</code> = unlimited.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Local folder</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>DRIVELITE_ROOT</code></td><td><code>/data</code></td><td>Folder to serve. Mount it read-only.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Git repository</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>DRIVELITE_GIT_URL</code></td><td>—</td><td>Repository to clone. Required.</td></tr>
+        <tr><td><code>DRIVELITE_GIT_REF</code></td><td>remote default</td><td>Branch, tag or commit.</td></tr>
+        <tr><td><code>DRIVELITE_GIT_SUBDIR</code></td><td>—</td><td>Serve only this directory of the repository.</td></tr>
+        <tr><td><code>DRIVELITE_GIT_INTERVAL</code></td><td><code>5m</code></td><td>Re-fetch interval. Minimum <code>1m</code>; <code>0</code> disables.</td></tr>
+        <tr><td><code>DRIVELITE_GIT_DEPTH</code></td><td><code>1</code></td><td>Shallow clone depth. <code>0</code> for a full clone.</td></tr>
+        <tr><td><code>DRIVELITE_GIT_USERNAME</code></td><td><code>x-access-token</code></td><td>Username paired with the token.</td></tr>
+        <tr><td><code>DRIVELITE_GIT_TOKEN</code></td><td>—</td><td>Access token for a private repository.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>S3 bucket</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>DRIVELITE_S3_ENDPOINT</code></td><td>—</td><td>e.g. <code>https://s3.eu-west-1.amazonaws.com</code>. Required.</td></tr>
+        <tr><td><code>DRIVELITE_S3_BUCKET</code></td><td>—</td><td>Bucket name. Required.</td></tr>
+        <tr><td><code>DRIVELITE_S3_PREFIX</code></td><td>—</td><td>Serve only this prefix of the bucket.</td></tr>
+        <tr><td><code>DRIVELITE_S3_REGION</code></td><td><code>us-east-1</code></td><td>Signing region.</td></tr>
+        <tr><td><code>DRIVELITE_S3_ACCESS_KEY</code></td><td>—</td><td>Omit both keys to read a public bucket.</td></tr>
+        <tr><td><code>DRIVELITE_S3_SECRET_KEY</code></td><td>—</td><td>&nbsp;</td></tr>
+        <tr><td><code>DRIVELITE_S3_SESSION_TOKEN</code></td><td>—</td><td>For temporary STS credentials.</td></tr>
+        <tr><td><code>DRIVELITE_S3_PATH_STYLE</code></td><td><code>true</code></td><td>Bucket in the path. <code>false</code> for AWS-style virtual hosts.</td></tr>
+        <tr><td><code>DRIVELITE_S3_CACHE_TTL</code></td><td><code>1m</code></td><td>How long listings are reused. <code>0</code> disables caching.</td></tr>
+        <tr><td><code>DRIVELITE_S3_TIMEOUT</code></td><td><code>60s</code></td><td>Response-header timeout per request.</td></tr>
       </tbody>
     </table>
 
@@ -372,6 +478,7 @@ DRIVELITE_PASSWORD=dev \
     <h3>What it defends against</h3>
     <ul class="tight">
       <li><strong>Path escape.</strong> Request paths are cleaned lexically, then the resolved path is checked <em>again</em> after symlink resolution — so a link inside the tree cannot point outside it. Symlinks leaving the root are skipped in listings entirely.</li>
+      <li><strong>Hidden files staying hidden.</strong> Any path with a dot-prefixed component is refused outright, not merely left out of the listing — omitting a guessable name from an index protects nothing, and for a git checkout <code>.git/</code> holds repository internals.</li>
       <li><strong>Session forgery.</strong> Cookies are HMAC-signed, carry an expiry, and are invalidated the moment a user is removed from the configuration.</li>
       <li><strong>Content injection.</strong> Only recognised media is served inline. HTML, SVG and unknown types are forced to download so they cannot execute in the app's origin. A strict CSP applies and the UI has no inline script.</li>
       <li><strong>Timing and guessing.</strong> Password comparison is constant-time — unknown usernames do the same work — and logins are rate limited per IP.</li>

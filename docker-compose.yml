@@ -1,16 +1,21 @@
+# drivelite can expose one of three backends. Pick a service below.
+#
+#   docker compose up folder      a directory on this machine
+#   docker compose up repo        a git repository
+#   docker compose up bucket      an S3-compatible bucket
+
 services:
-  drivelite:
+  # ---- a local folder -------------------------------------------------
+  folder:
     build: .
     image: drivelite:latest
-    container_name: drivelite
-    restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
       # The folder you want to share. Read-only: the app never writes to it.
       - ./share:/data:ro
-      # Thumbnail cache. Keep it on a named volume so it survives restarts.
-      - thumbs:/cache
+      # Thumbnail cache. A named volume keeps it across restarts.
+      - cache:/cache
     environment:
       DRIVELITE_TITLE: "Shared Files"
       # Set a real password before exposing this anywhere.
@@ -21,14 +26,77 @@ services:
       # DRIVELITE_SESSION_KEY: "replace-with-32-plus-random-bytes"
       # Turn on when running behind HTTPS.
       DRIVELITE_SECURE_COOKIE: "false"
-      DRIVELITE_THUMB_PX: "400"
-      DRIVELITE_THUMB_JOBS: "4"
-      DRIVELITE_ENABLE_ZIP: "true"
-      # DRIVELITE_MAX_ZIP_MB: "4096"
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  # ---- a git repository -----------------------------------------------
+  repo:
+    build: .
+    image: drivelite:latest
+    ports:
+      - "8081:8080"
+    volumes:
+      - cache:/cache
+    environment:
+      DRIVELITE_BACKEND: git
+      DRIVELITE_TITLE: "Repo Browser"
+      DRIVELITE_PASSWORD: "change-me"
+      DRIVELITE_GIT_URL: "https://github.com/sirmmo/drivelite.git"
+      # Branch, tag or commit. Empty means the remote's default branch.
+      DRIVELITE_GIT_REF: "main"
+      # Serve only part of the repository.
+      # DRIVELITE_GIT_SUBDIR: "docs"
+      # How often to re-fetch. Minimum 1m; 0 disables refreshing.
+      DRIVELITE_GIT_INTERVAL: "5m"
+      # For a private repository:
+      # DRIVELITE_GIT_TOKEN: "ghp_..."
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  # ---- an S3-compatible bucket ----------------------------------------
+  bucket:
+    build: .
+    image: drivelite:latest
+    ports:
+      - "8082:8080"
+    volumes:
+      - cache:/cache
+    environment:
+      DRIVELITE_BACKEND: s3
+      DRIVELITE_TITLE: "Bucket Browser"
+      DRIVELITE_PASSWORD: "change-me"
+      # For AWS use https://s3.<region>.amazonaws.com
+      DRIVELITE_S3_ENDPOINT: "http://minio:9000"
+      DRIVELITE_S3_BUCKET: "photos"
+      DRIVELITE_S3_REGION: "us-east-1"
+      DRIVELITE_S3_ACCESS_KEY: "minioadmin"
+      DRIVELITE_S3_SECRET_KEY: "minioadmin"
+      # Serve only one prefix of the bucket.
+      # DRIVELITE_S3_PREFIX: "holiday/"
+      # Path style suits self-hosted services; set false for AWS-style hosts.
+      DRIVELITE_S3_PATH_STYLE: "true"
+      # How long directory listings are reused before re-querying.
+      DRIVELITE_S3_CACHE_TTL: "1m"
+    depends_on: [minio]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  # A local S3 service, so the "bucket" example runs out of the box.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio:/data
 
 volumes:
-  thumbs:
+  cache:
+  minio:
