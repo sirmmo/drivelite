@@ -20,7 +20,7 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/drivelite .
 
 # ---- runtime ----
-FROM alpine:3.20
+FROM alpine:3.24
 
 # git is needed only by the git backend, but installing it unconditionally
 # keeps a single image for all three backends. It costs about 10 MB once its
